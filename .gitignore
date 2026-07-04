@@ -1,5 +1,6 @@
 ﻿# caches / build
 __pycache__/
+.configs/
 *.pyc
 .venv/
 venv/

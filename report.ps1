@@ -34,6 +34,25 @@ function Log($m){
   try { Add-Content -Path $LogFile -Value $line -Encoding utf8 } catch {}
 }
 
+# Pull the central linter configs from codehealth so configs/ is the single source of
+# truth for the Windows-side linters too (detekt/PSSA/ruff). Cache in .configs\; on a
+# fetch failure fall back to the cached copy, else the linter uses its own defaults.
+function Fetch-Configs($baseUrl, $token, $cacheDir){
+  if(-not (Test-Path $cacheDir)){ New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
+  foreach($n in @("detekt.yml","PSScriptAnalyzerSettings.psd1","ruff.toml")){
+    $dest = Join-Path $cacheDir $n
+    try{
+      Invoke-WebRequest -Uri "$baseUrl/$n" -Headers @{ Authorization = "Bearer $token" } `
+        -TimeoutSec 15 -UseBasicParsing -OutFile $dest
+      Log "config fetched: $n"
+    }catch{
+      if(Test-Path $dest){ Log "config $n fetch failed — using cached copy" }
+      else{ Log "config $n unavailable and no cache — linter falls back to defaults" }
+    }
+  }
+  return $cacheDir
+}
+
 function Get-CodeFiles($repo){
   Get-ChildItem -Path $repo -Recurse -File -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -notmatch '\\(\.git|\.venv|venv|node_modules|__pycache__|build|dist)\\' }
@@ -78,7 +97,10 @@ function Git-Hotspots($repo){
 function Run-PSSA($repo){
   $out=@()
   try{
-    $res = Invoke-ScriptAnalyzer -Path $repo -Recurse -ErrorAction SilentlyContinue
+    $sa = @{ Path=$repo; Recurse=$true; ErrorAction="SilentlyContinue" }
+    $settings = Join-Path $script:ConfigDir "PSScriptAnalyzerSettings.psd1"
+    if($script:ConfigDir -and (Test-Path $settings)){ $sa["Settings"] = $settings }
+    $res = Invoke-ScriptAnalyzer @sa
     foreach($r in $res){
       $sev = switch("$($r.Severity)"){ "Error"{"error"} "Warning"{"warning"} default{"info"} }
       $rel = $r.ScriptPath; if($rel){ $rel = $rel.Replace($repo,"").TrimStart("\","/") }
@@ -93,7 +115,9 @@ function Run-Ruff($repo){
   $ruff = (Get-Command ruff -ErrorAction SilentlyContinue).Source
   if(-not $ruff){ return $out }
   try{
-    $json = & $ruff check --output-format=json --exit-zero --no-cache $repo 2>$null
+    $rc = Join-Path $script:ConfigDir "ruff.toml"
+    $cfgArgs = @(); if($script:ConfigDir -and (Test-Path $rc)){ $cfgArgs = @("--config", $rc) }
+    $json = & $ruff check @cfgArgs --output-format=json --exit-zero --no-cache $repo 2>$null
     if($json){ ($json | ConvertFrom-Json) | ForEach-Object {
       $rel=$_.filename; if($rel){ $rel=$rel.Replace($repo,"").TrimStart("\","/") }
       $out += @{ file=$rel; line=[int]$_.location.row; tool="ruff";
@@ -107,8 +131,13 @@ function Run-Detekt($repo){
   if(-not (Test-Path $jar)){ return $out }
   if(-not (Get-Command java -ErrorAction SilentlyContinue)){ return $out }
   $sarif = Join-Path $env:TEMP ("detekt-{0}.sarif" -f ([guid]::NewGuid().ToString("N")))
+  # layer our overrides on the default ruleset to cut style noise (MagicNumber etc.);
+  # config pulled from codehealth into .configs\ (falls back to default if absent)
+  $cfg = Join-Path $script:ConfigDir "detekt.yml"
+  $cfgArgs = @()
+  if(Test-Path $cfg){ $cfgArgs = @("--config", $cfg, "--build-upon-default-config") }
   try{
-    & java -jar $jar --input $repo --report ("sarif:{0}" -f $sarif) 2>$null | Out-Null
+    & java -jar $jar --input $repo @cfgArgs --report ("sarif:{0}" -f $sarif) 2>$null | Out-Null
     if(Test-Path $sarif){
       $s = Get-Content $sarif -Raw | ConvertFrom-Json
       foreach($run in $s.runs){ foreach($r in $run.results){
@@ -157,9 +186,19 @@ function Std-Checks($repo,$files){
   }
 }
 
+# --- fetch central linter configs (single source of truth = codehealth/configs) ----
+if(-not (Test-Path $TokenFile)){ Log "FATAL: token file missing: $TokenFile"; exit 1 }
+$token = (Get-Content $TokenFile -Raw).Trim()
+$ConfigBase = $Endpoint -replace '/api/ingest$', '/api/config'
+$script:ConfigDir = Fetch-Configs $ConfigBase $token (Join-Path $Root ".configs")
+
 # --- collect repos -----------------------------------------------------------------
 $repoDirs = @()
-if(Test-Path $ToolsRoot){ $repoDirs += (Get-ChildItem $ToolsRoot -Directory | ForEach-Object { $_.FullName }) }
+if(Test-Path $ToolsRoot){
+  $repoDirs += (Get-ChildItem $ToolsRoot -Directory |
+    Where-Object { $_.Name -notmatch '\.bak$|junction|\.premesh' } |
+    ForEach-Object { $_.FullName })
+}
 foreach($e in $ExtraRepos){ if(Test-Path $e){ $repoDirs += $e } }
 
 $inventory=@(); $projects=@()
@@ -169,7 +208,8 @@ foreach($repo in $repoDirs){
   $files = @(Get-CodeFiles $repo)
   $lg = Detect-Language $files
   $hasGit = Test-Path (Join-Path $repo ".git")
-  $remote = ""; if($hasGit){ $remote = (git -C $repo remote get-url origin 2>$null); if(-not $remote){$remote=""} }
+  $remote = ""
+  if($hasGit){ try { $remote = (& git -C $repo remote get-url origin 2>$null); if(-not $remote){$remote=""} } catch { $remote="" } }
 
   $inventory += @{ name=$name; path=$repo; remote="$remote"; language=$lg.lang;
                    n_code_files=$lg.n; has_git=[bool]$hasGit; is_vendor=$false }
@@ -189,9 +229,7 @@ foreach($repo in $repoDirs){
                   git=$git; linted=$linted }
 }
 
-# --- push --------------------------------------------------------------------------
-if(-not (Test-Path $TokenFile)){ Log "FATAL: token file missing: $TokenFile"; exit 1 }
-$token = (Get-Content $TokenFile -Raw).Trim()
+# --- push ($token already resolved for the config fetch above) ---------------------
 $payload = @{ host=$env:COMPUTERNAME; inventory=@($inventory); projects=@($projects) }
 $body = $payload | ConvertTo-Json -Depth 8
 Log ("posting {0} inventory / {1} projects ({2} bytes)" -f $inventory.Count, $projects.Count, $body.Length)
