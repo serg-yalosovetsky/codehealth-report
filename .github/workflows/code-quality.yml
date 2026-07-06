@@ -1,0 +1,84 @@
+name: code-quality
+# Universal quality workflow — auto-detects languages and runs the matching linter with
+# codehealth's CENTRAL config (single source of truth), ANNOTATE-ONLY: findings show as
+# inline PR annotations but never block, except code that is genuinely broken (syntax /
+# undefined names). A SonarQube scan feeds the self-hosted server for languages it covers.
+# Policy: collect data now; switch to a blocking gate later, per repo, after cleanup.
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup python
+        if: hashFiles('**/*.py') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: ruff (annotate; block only on broken code)
+        if: hashFiles('**/*.py') != ''
+        run: |
+          pipx install ruff
+          curl -fsS -H "Authorization: Bearer ${{ secrets.CODEHEALTH_INGEST_TOKEN }}" \
+            https://codehealth.ibotz.fun/api/config/ruff.toml -o /tmp/ruff.toml
+          ruff check --config /tmp/ruff.toml --output-format=github --exit-zero .
+          ruff check --select E999,F821,F822,F823,F811 --output-format=github .
+
+      - name: oxlint (annotate; blocks only on parse errors)
+        if: hashFiles('**/*.js','**/*.jsx','**/*.ts','**/*.tsx','**/*.mjs','**/*.cjs') != ''
+        run: |
+          curl -fsS -H "Authorization: Bearer ${{ secrets.CODEHEALTH_INGEST_TOKEN }}" \
+            https://codehealth.ibotz.fun/api/config/oxlintrc.json -o .oxlintrc.json
+          npx --yes oxlint -c .oxlintrc.json --format=github .
+
+      - name: shellcheck (annotate)
+        if: hashFiles('**/*.sh','**/*.bash') != ''
+        run: |
+          find . -type f \( -name '*.sh' -o -name '*.bash' \) -not -path '*/.git/*' -print0 \
+            | xargs -0 -r shellcheck -f gcc -S warning -e SC1090,SC1091,SC2154 || true
+
+      - name: setup go
+        if: hashFiles('**/*.go') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - name: gofumpt (annotate formatting drift)
+        if: hashFiles('**/*.go') != ''
+        run: |
+          go install mvdan.cc/gofumpt@latest
+          "$(go env GOPATH)/bin/gofumpt" -l . | while read -r f; do
+            echo "::warning file=$f::not gofmt/gofumpt-formatted (run gofumpt -w)"; done
+
+      - name: PSScriptAnalyzer (annotate)
+        if: hashFiles('**/*.ps1','**/*.psm1') != ''
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction SilentlyContinue
+          Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "::warning file=$($_.ScriptPath),line=$($_.Line)::$($_.RuleName): $($_.Message)" }
+
+  sonar:
+    # only for languages SonarQube Community covers
+    if: hashFiles('**/*.py','**/*.js','**/*.jsx','**/*.ts','**/*.tsx','**/*.go','**/*.kt','**/*.kts','**/*.java') != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: key
+        name: lowercase project key (match codehealth canonical name)
+        run: echo "k=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonar.ibotz.fun
+        with:
+          args: >
+            -Dsonar.projectKey=${{ steps.key.outputs.k }}
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/node_modules/**,**/.venv/**,**/venv/**,**/vendor/**,**/dist/**,**/build/**,**/.next/**,**/*.min.js,**/data/repos/**
