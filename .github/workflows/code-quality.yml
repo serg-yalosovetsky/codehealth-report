@@ -62,8 +62,6 @@ jobs:
             ForEach-Object { Write-Host "::warning file=$($_.ScriptPath),line=$($_.Line)::$($_.RuleName): $($_.Message)" }
 
   sonar:
-    # only for languages SonarQube Community covers
-    if: hashFiles('**/*.py','**/*.js','**/*.jsx','**/*.ts','**/*.tsx','**/*.go','**/*.kt','**/*.kts','**/*.java') != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,6 +71,8 @@ jobs:
         name: lowercase project key (match codehealth canonical name)
         run: echo "k=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
       - name: SonarQube scan
+        # only for languages SonarQube Community covers (hashFiles is allowed at step level)
+        if: hashFiles('**/*.py','**/*.js','**/*.jsx','**/*.ts','**/*.tsx','**/*.go','**/*.kt','**/*.kts','**/*.java') != ''
         uses: SonarSource/sonarqube-scan-action@v4
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
