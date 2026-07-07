@@ -69,6 +69,36 @@ jobs:
       - id: key
         name: lowercase project key (match codehealth canonical name)
         run: echo "k=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # --- run existing tests + collect coverage (non-blocking; fed to Sonar below) ---
+      - name: setup python
+        if: hashFiles('**/test_*.py','**/*_test.py','**/tests/**') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: python tests + coverage
+        if: hashFiles('**/test_*.py','**/*_test.py','**/tests/**') != ''
+        run: |
+          python -m pip install -q pytest pytest-cov
+          pip install -q -e . 2>/dev/null || pip install -q -r requirements.txt 2>/dev/null || true
+          # PYTHONPATH=. so flat-layout repos (package dir at repo root) import cleanly
+          PYTHONPATH=. pytest --cov=. --cov-report=xml -q || true
+
+      - name: setup go
+        if: hashFiles('**/*_test.go') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - name: go tests + coverage
+        if: hashFiles('**/*_test.go') != ''
+        run: go test -coverprofile=coverage.out ./... || true
+
+      - name: node tests
+        if: hashFiles('**/package.json') != ''
+        run: |
+          npm ci 2>/dev/null || npm install 2>/dev/null || true
+          npm test 2>/dev/null || true
+
       - name: SonarQube scan
         # only for languages SonarQube Community covers (hashFiles is allowed at step level)
         if: hashFiles('**/*.py','**/*.js','**/*.jsx','**/*.ts','**/*.tsx','**/*.go','**/*.kt','**/*.kts','**/*.java') != ''
@@ -81,3 +111,6 @@ jobs:
             -Dsonar.projectKey=${{ steps.key.outputs.k }}
             -Dsonar.sources=.
             -Dsonar.exclusions=**/node_modules/**,**/.venv/**,**/venv/**,**/vendor/**,**/dist/**,**/build/**,**/.next/**,**/*.min.js,**/data/repos/**
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.go.coverage.reportPaths=coverage.out
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info,**/lcov.info
